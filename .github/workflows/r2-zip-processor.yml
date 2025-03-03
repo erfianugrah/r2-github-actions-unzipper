@@ -11,7 +11,22 @@ jobs:
     outputs:
       zip_files: ${{ steps.scan.outputs.zip_files }}
       file_count: ${{ steps.scan.outputs.file_count }}
+      trigger_type: ${{ steps.debug.outputs.trigger_type }}
     steps:
+      - name: Debug Workflow Trigger
+        id: debug
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "This workflow was triggered by a schedule"
+            echo "trigger_type=schedule" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "This workflow was triggered manually via workflow_dispatch"
+            echo "trigger_type=manual" >> $GITHUB_OUTPUT
+          else
+            echo "This workflow was triggered by: ${{ github.event_name }}"
+            echo "trigger_type=${{ github.event_name }}" >> $GITHUB_OUTPUT
+          fi
+          
       - name: Checkout repository
         uses: actions/checkout@v3
       
@@ -324,6 +339,7 @@ jobs:
           echo ""
           echo "## Summary"
           echo "- Files scanned: Completed"
+          echo "- Trigger type: ${{ needs.scan-r2-bucket.outputs.trigger_type }}"
           
           if [[ "${{ needs.scan-r2-bucket.outputs.file_count }}" == "0" ]]; then
             echo "- No ZIP files found to process"
