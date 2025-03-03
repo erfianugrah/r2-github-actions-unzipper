@@ -3,7 +3,7 @@ name: R2 Zip Processor
 on:
   workflow_dispatch:  # Manual trigger
   schedule:
-    - cron: '*/15 * * * *'  # Run every 15 minutes
+    - cron: '* * * * *'  # Run every minute
 
 jobs:
   process-zip-files:
