@@ -1,0 +1,158 @@
+name: R2 Zip Processor
+
+on:
+  workflow_dispatch:  # Manual trigger
+  schedule:
+    - cron: '*/15 * * * *'  # Run every 15 minutes
+
+jobs:
+  process-zip-files:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 requests
+      
+      - name: Process R2 zip files
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          python - <<EOF
+          import os
+          import tempfile
+          import zipfile
+          import mimetypes
+          import boto3
+          from botocore.client import Config
+          
+          # Configure S3 client for R2
+          s3 = boto3.client('s3',
+              endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+              aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
+              aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'],
+              config=Config(signature_version='v4')
+          )
+          
+          # Set prefixes
+          processed_prefix = "processed/"
+          unzipped_prefix = "unzipped/"
+          
+          # Get list of files
+          print("Listing files in R2 bucket...")
+          response = s3.list_objects_v2(Bucket=os.environ['R2_BUCKET_NAME'])
+          
+          # Build set of already processed files
+          processed_files = set()
+          try:
+              processed_response = s3.list_objects_v2(
+                  Bucket=os.environ['R2_BUCKET_NAME'],
+                  Prefix=processed_prefix
+              )
+              if 'Contents' in processed_response:
+                  for item in processed_response['Contents']:
+                      filename = item['Key'].replace(processed_prefix, '', 1)
+                      processed_files.add(filename)
+          except Exception as e:
+              print(f"Warning: Error checking processed files: {e}")
+          
+          # Process zip files
+          if 'Contents' in response:
+              for item in response['Contents']:
+                  filename = item['Key']
+                  
+                  # Skip files in processed or unzipped directories
+                  if filename.startswith(processed_prefix) or filename.startswith(unzipped_prefix):
+                      continue
+                  
+                  # Skip non-zip files
+                  if not filename.lower().endswith('.zip'):
+                      continue
+                  
+                  # Skip if already processed
+                  base_filename = os.path.basename(filename)
+                  if base_filename in processed_files:
+                      print(f"Skipping already processed file: {filename}")
+                      continue
+                  
+                  print(f"Processing zip file: {filename}")
+                  
+                  # Create temp directory
+                  with tempfile.TemporaryDirectory() as temp_dir:
+                      # Download zip file
+                      zip_path = os.path.join(temp_dir, os.path.basename(filename))
+                      s3.download_file(os.environ['R2_BUCKET_NAME'], filename, zip_path)
+                      
+                      # Extract zip contents
+                      extract_dir = os.path.join(temp_dir, 'extracted')
+                      os.makedirs(extract_dir, exist_ok=True)
+                      
+                      try:
+                          with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                              print(f"Extracting {len(zip_ref.namelist())} files from {filename}")
+                              zip_ref.extractall(extract_dir)
+                          
+                          # Base folder name for extraction (without .zip extension)
+                          base_folder = os.path.splitext(os.path.basename(filename))[0]
+                          
+                          # Upload extracted files
+                          file_count = 0
+                          for root, _, files in os.walk(extract_dir):
+                              for file in files:
+                                  file_path = os.path.join(root, file)
+                                  relative_path = os.path.relpath(file_path, extract_dir)
+                                  
+                                  # Get content type
+                                  mime_type, _ = mimetypes.guess_type(file_path)
+                                  content_type = mime_type or 'application/octet-stream'
+                                  
+                                  # Upload path: unzipped/base_folder/relative_path
+                                  upload_path = f"{unzipped_prefix}{base_folder}/{relative_path}"
+                                  
+                                  print(f"Uploading {relative_path} as {content_type}")
+                                  s3.upload_file(
+                                      file_path, 
+                                      os.environ['R2_BUCKET_NAME'], 
+                                      upload_path,
+                                      ExtraArgs={'ContentType': content_type}
+                                  )
+                                  file_count += 1
+                          
+                          print(f"Uploaded {file_count} extracted files to R2")
+                          
+                          # Move the original zip to the processed directory
+                          processed_key = f"{processed_prefix}{os.path.basename(filename)}"
+                          print(f"Moving original zip to {processed_key}")
+                          
+                          s3.copy_object(
+                              Bucket=os.environ['R2_BUCKET_NAME'],
+                              CopySource={'Bucket': os.environ['R2_BUCKET_NAME'], 'Key': filename},
+                              Key=processed_key
+                          )
+                          
+                          # Delete the original zip file
+                          print(f"Deleting original zip file: {filename}")
+                          s3.delete_object(Bucket=os.environ['R2_BUCKET_NAME'], Key=filename)
+                          
+                          print(f"Successfully processed {filename}")
+                          
+                      except zipfile.BadZipFile:
+                          print(f"Error: File {filename} is not a valid zip file")
+                      except Exception as e:
+                          print(f"Error processing zip file {filename}: {str(e)}")
+          
+              print("Zip processing complete")
+          else:
+              print("No files found in bucket")
+          EOF
