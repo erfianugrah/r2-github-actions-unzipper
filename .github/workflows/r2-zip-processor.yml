@@ -13,23 +13,15 @@ jobs:
       file_count: ${{ steps.scan.outputs.file_count }}
       trigger_type: ${{ steps.debug.outputs.trigger_type }}
     steps:
-      - name: Debug Workflow Trigger
-        id: debug
-        run: |
-          if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            echo "This workflow was triggered by a schedule"
-            echo "trigger_type=schedule" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "This workflow was triggered manually via workflow_dispatch"
-            echo "trigger_type=manual" >> $GITHUB_OUTPUT
-          else
-            echo "This workflow was triggered by: ${{ github.event_name }}"
-            echo "trigger_type=${{ github.event_name }}" >> $GITHUB_OUTPUT
-          fi
-          
       - name: Checkout repository
         uses: actions/checkout@v3
       
+      - name: Debug Workflow Trigger
+        id: debug
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: .github/scripts/debug_workflow_trigger.sh
+          
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -47,73 +39,7 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-        run: |
-          python - <<EOF
-          import os
-          import json
-          import boto3
-          from botocore.client import Config
-          
-          # Configure S3 client for R2
-          s3 = boto3.client('s3',
-              endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
-              aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
-              aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'],
-              config=Config(signature_version='v4')
-          )
-          
-          # Set prefixes to skip
-          processed_prefix = "processed/"
-          unzipped_prefix = "unzipped/"
-          
-          # Get all files
-          zip_files = []
-          print("Scanning R2 bucket for ZIP files...")
-          response = s3.list_objects_v2(Bucket=os.environ['R2_BUCKET_NAME'])
-          
-          # Build set of already processed files
-          processed_files = set()
-          try:
-              processed_response = s3.list_objects_v2(
-                  Bucket=os.environ['R2_BUCKET_NAME'],
-                  Prefix=processed_prefix
-              )
-              if 'Contents' in processed_response:
-                  for item in processed_response['Contents']:
-                      filename = item['Key'].replace(processed_prefix, '', 1)
-                      processed_files.add(filename)
-          except Exception as e:
-              print(f"Warning: Error checking processed files: {e}")
-          
-          # Find zip files
-          if 'Contents' in response:
-              for item in response['Contents']:
-                  filename = item['Key']
-                  
-                  # Skip files in processed or unzipped directories
-                  if filename.startswith(processed_prefix) or filename.startswith(unzipped_prefix):
-                      continue
-                  
-                  # Skip non-zip files
-                  if not filename.lower().endswith('.zip'):
-                      continue
-                  
-                  # Skip if already processed
-                  base_filename = os.path.basename(filename)
-                  if base_filename in processed_files:
-                      print(f"Skipping already processed file: {filename}")
-                      continue
-                  
-                  # Add to list of files to process
-                  zip_files.append(filename)
-          
-          # Output the list as JSON
-          print(f"Found {len(zip_files)} ZIP files to process")
-          output_json = json.dumps(zip_files)
-          with open(os.environ.get('GITHUB_OUTPUT', ''), 'a') as f:
-              print(f"zip_files={output_json}", file=f)
-              print(f"file_count={len(zip_files)}", file=f)
-          EOF
+        run: python .github/scripts/scan_zip_files.py
   
   process-zip-files:
     needs: scan-r2-bucket
@@ -148,191 +74,16 @@ jobs:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           ZIP_FILE: ${{ matrix.file }}
-        run: |
-          python - <<EOF
-          import os
-          import tempfile
-          import zipfile
-          import mimetypes
-          import boto3
-          import concurrent.futures
-          import io
-          from botocore.client import Config
-          
-          # Configure S3 client for R2 with increased max_pool_connections
-          s3_config = Config(
-              signature_version='v4',
-              max_pool_connections=50,
-              retries={'max_attempts': 3, 'mode': 'standard'}
-          )
-          
-          s3 = boto3.client('s3',
-              endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
-              aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
-              aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'],
-              config=s3_config
-          )
-          
-          # Set prefixes
-          processed_prefix = "processed/"
-          unzipped_prefix = "unzipped/"
-          
-          # Get the file from environment
-          filename = os.environ['ZIP_FILE']
-          print(f"Processing ZIP file: {filename}")
-          
-          # Function to upload a single file to R2 backup directory
-          def upload_to_backup(args):
-              file_path, relative_path, base_folder = args
-              try:
-                  # Get content type
-                  mime_type, _ = mimetypes.guess_type(file_path)
-                  content_type = mime_type or 'application/octet-stream'
-                  
-                  # Upload path: unzipped/base_folder/relative_path
-                  upload_path = f"{unzipped_prefix}{base_folder}/{relative_path}"
-                  
-                  # Upload the file
-                  s3.upload_file(
-                      file_path, 
-                      os.environ['R2_BUCKET_NAME'], 
-                      upload_path,
-                      ExtraArgs={'ContentType': content_type}
-                  )
-                  return True
-              except Exception as e:
-                  print(f"Error uploading backup {relative_path}: {e}")
-                  return False
-              
-          # Create temp directory
-          with tempfile.TemporaryDirectory() as temp_dir:
-              # Download zip file
-              zip_path = os.path.join(temp_dir, os.path.basename(filename))
-              try:
-                  print(f"Downloading {filename}...")
-                  s3.download_file(os.environ['R2_BUCKET_NAME'], filename, zip_path)
-              except Exception as e:
-                  print(f"Error downloading file {filename}: {str(e)}")
-                  exit(1)
-              
-              # Extract zip contents
-              extract_dir = os.path.join(temp_dir, 'extracted')
-              os.makedirs(extract_dir, exist_ok=True)
-              
-              try:
-                  # Extract the zip file
-                  file_count = 0
-                  upload_tasks = []
-                  
-                  with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                      file_list = zip_ref.namelist()
-                      print(f"Extracting {len(file_list)} files from {filename}")
-                      zip_ref.extractall(extract_dir)
-                  
-                  # Base folder name for extraction (without .zip extension)
-                  base_folder = os.path.splitext(os.path.basename(filename))[0]
-                  
-                  # Prepare upload tasks
-                  for root, _, files in os.walk(extract_dir):
-                      for file in files:
-                          file_path = os.path.join(root, file)
-                          relative_path = os.path.relpath(file_path, extract_dir)
-                          upload_tasks.append((file_path, relative_path, base_folder))
-                          file_count += 1
-                  
-                  if file_count == 0:
-                      print(f"Warning: ZIP file {filename} is empty!")
-                      exit(0)
-                      
-                  print(f"Found {file_count} files to upload")
-                  
-                  # Get the original directory where the zip file was located
-                  original_dir = os.path.dirname(filename)
-                  if original_dir and not original_dir.endswith('/'):
-                      original_dir += '/'
-                      
-                  # Upload files in parallel to their original location
-                  successful_uploads = 0
-                  with concurrent.futures.ThreadPoolExecutor(max_workers=10) as upload_executor:
-                      upload_futures = []
-                      
-                      for file_path, relative_path, _ in upload_tasks:
-                          # Target path is the original directory + relative path
-                          target_path = f"{original_dir}{relative_path}" if original_dir else relative_path
-                          
-                          # Get content type
-                          mime_type, _ = mimetypes.guess_type(file_path)
-                          content_type = mime_type or 'application/octet-stream'
-                          
-                          # Submit upload task
-                          future = upload_executor.submit(
-                              s3.upload_file,
-                              file_path,
-                              os.environ['R2_BUCKET_NAME'],
-                              target_path,
-                              ExtraArgs={'ContentType': content_type}
-                          )
-                          upload_futures.append((future, relative_path))
-                          
-                      # Process results as they complete
-                      for future, file_name in upload_futures:
-                          try:
-                              future.result()
-                              successful_uploads += 1
-                          except Exception as e:
-                              print(f"Error uploading {file_name}: {e}")
-                  
-                  print(f"Uploaded {successful_uploads}/{file_count} extracted files to their original location")
-                  
-                  if successful_uploads == 0:
-                      print("Failed to upload any files - aborting")
-                      exit(1)
-                  
-                  # Upload files to backup location
-                  print(f"Creating backup copies in {unzipped_prefix}...")
-                  backup_uploads = 0
-                  with concurrent.futures.ThreadPoolExecutor(max_workers=10) as upload_executor:
-                      future_to_file = {upload_executor.submit(upload_to_backup, task): task[1] for task in upload_tasks}
-                      
-                      for future in concurrent.futures.as_completed(future_to_file):
-                          file_name = future_to_file[future]
-                          try:
-                              if future.result():
-                                  backup_uploads += 1
-                          except Exception as e:
-                              print(f"Error in backup upload: {e}")
-                  
-                  print(f"Backed up {backup_uploads}/{file_count} extracted files")
-                  
-                  # Store original zip in processed directory
-                  processed_key = f"{processed_prefix}{os.path.basename(filename)}"
-                  print(f"Storing original zip in {processed_key}")
-                  
-                  s3.copy_object(
-                      Bucket=os.environ['R2_BUCKET_NAME'],
-                      CopySource={'Bucket': os.environ['R2_BUCKET_NAME'], 'Key': filename},
-                      Key=processed_key
-                  )
-                  
-                  # Delete the original zip file
-                  print(f"Deleting original zip file: {filename}")
-                  s3.delete_object(Bucket=os.environ['R2_BUCKET_NAME'], Key=filename)
-                  
-                  print(f"Successfully processed {filename}")
-                  
-              except zipfile.BadZipFile:
-                  print(f"Error: File {filename} is not a valid zip file")
-                  exit(1)
-              except Exception as e:
-                  print(f"Error processing zip file {filename}: {str(e)}")
-                  exit(1)
-          EOF
+        run: python .github/scripts/process_zip_file.py
   
   cleanup-directories:
     needs: [scan-r2-bucket, process-zip-files]
     if: always() && needs.scan-r2-bucket.result == 'success' && needs.process-zip-files.result == 'success' && needs.scan-r2-bucket.outputs.file_count != '0'
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -350,134 +101,20 @@ jobs:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           ZIP_FILES: ${{ needs.scan-r2-bucket.outputs.zip_files }}
-        run: |
-          python - <<EOF
-          import os
-          import json
-          import boto3
-          from botocore.client import Config
-          
-          # Configure S3 client for R2
-          s3 = boto3.client('s3',
-              endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
-              aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
-              aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'],
-              config=Config(signature_version='v4')
-          )
-          
-          # Get list of processed zip files from this run
-          zip_files = json.loads(os.environ['ZIP_FILES'])
-          print(f"Processing cleanup for {len(zip_files)} zip files")
-          
-          # Set prefixes
-          processed_prefix = "processed/"
-          unzipped_prefix = "unzipped/"
-          
-          # Build list of objects to delete
-          objects_to_delete = []
-          
-          # For each zip file that was processed in this run
-          for zip_file in zip_files:
-              zip_basename = os.path.basename(zip_file)
-              base_folder = os.path.splitext(zip_basename)[0]
-              
-              # Add the processed zip file
-              processed_key = f"{processed_prefix}{zip_basename}"
-              objects_to_delete.append(processed_key)
-              print(f"Will delete processed file: {processed_key}")
-              
-              # Find and add all files in the unzipped backup directory for this zip
-              backup_prefix = f"{unzipped_prefix}{base_folder}/"
-              
-              continuation_token = None
-              backup_count = 0
-              
-              while True:
-                  list_args = {
-                      'Bucket': os.environ['R2_BUCKET_NAME'],
-                      'Prefix': backup_prefix
-                  }
-                  
-                  if continuation_token:
-                      list_args['ContinuationToken'] = continuation_token
-              
-                  response = s3.list_objects_v2(**list_args)
-                  
-                  if 'Contents' in response:
-                      for item in response['Contents']:
-                          objects_to_delete.append(item['Key'])
-                          backup_count += 1
-                  
-                  if not response.get('IsTruncated'):
-                      break
-                      
-                  continuation_token = response.get('NextContinuationToken')
-              
-              print(f"Will delete {backup_count} backup files for {base_folder}")
-          
-          # Delete objects in batches of 1000 (S3 limit)
-          total_deleted = 0
-          batch_size = 1000
-          
-          for i in range(0, len(objects_to_delete), batch_size):
-              batch = objects_to_delete[i:i+batch_size]
-              
-              if not batch:
-                  continue
-                  
-              delete_response = s3.delete_objects(
-                  Bucket=os.environ['R2_BUCKET_NAME'],
-                  Delete={'Objects': [{'Key': key} for key in batch]}
-              )
-              
-              batch_deleted = len(batch)
-              total_deleted += batch_deleted
-              print(f"Deleted batch of {batch_deleted} objects")
-              
-              if 'Errors' in delete_response and delete_response['Errors']:
-                  for error in delete_response['Errors']:
-                      print(f"Error deleting {error['Key']}: {error['Message']}")
-                      total_deleted -= 1
-          
-          print(f"Total deleted objects: {total_deleted}")
-          print("Cleanup completed successfully")
-          EOF
+        run: python .github/scripts/cleanup_processed_files.py
 
   report-results:
     needs: [scan-r2-bucket, process-zip-files, cleanup-directories]
     if: always() && needs.scan-r2-bucket.result == 'success'
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        
       - name: Generate Report
-        run: |
-          echo "# R2 Zip Processing Report"
-          echo ""
-          echo "## Summary"
-          echo "- Files scanned: Completed"
-          echo "- Trigger type: ${{ needs.scan-r2-bucket.outputs.trigger_type }}"
-          
-          if [[ "${{ needs.scan-r2-bucket.outputs.file_count }}" == "0" ]]; then
-            echo "- No ZIP files found to process"
-          else
-            echo "- ZIP files found: ${{ needs.scan-r2-bucket.outputs.file_count }}"
-            
-            if [[ "${{ needs.process-zip-files.result }}" == "success" ]]; then
-              echo "- All files processed successfully"
-              
-              if [[ "${{ needs.cleanup-directories.result }}" == "success" ]]; then
-                echo "- Backup and processed directories cleaned up successfully"
-              elif [[ "${{ needs.cleanup-directories.result }}" == "skipped" ]]; then
-                echo "- Cleanup was skipped"
-              else
-                echo "- Cleanup failed. Check job logs for details."
-              fi
-            elif [[ "${{ needs.process-zip-files.result }}" == "skipped" ]]; then
-              echo "- No files to process"
-            else
-              echo "- Some files failed to process. Check job logs for details."
-            fi
-          fi
-          
-          echo ""
-          echo "## Next Steps"
-          echo "- The workflow will run again in 5 minutes to check for new ZIP files"
+        env:
+          TRIGGER_TYPE: ${{ needs.scan-r2-bucket.outputs.trigger_type }}
+          FILE_COUNT: ${{ needs.scan-r2-bucket.outputs.file_count }}
+          PROCESS_RESULT: ${{ needs.process-zip-files.result }}
+          CLEANUP_RESULT: ${{ needs.cleanup-directories.result }}
+        run: .github/scripts/generate_report.sh
