@@ -157,10 +157,48 @@ jobs:
                                           upload_tasks.append((file_path, relative_path, base_folder))
                                           file_count += 1
                                   
-                                  # Upload files in parallel (up to 10 at a time)
+                                  # Get the original directory where the zip file was located
+                                  original_dir = os.path.dirname(filename)
+                                  if original_dir and not original_dir.endswith('/'):
+                                      original_dir += '/'
+                                      
+                                  # Upload files in parallel (up to 10 at a time) to their original location
                                   successful_uploads = 0
                                   with concurrent.futures.ThreadPoolExecutor(max_workers=10) as upload_executor:
-                                      # Submit all upload tasks
+                                      upload_futures = []
+                                      
+                                      for file_path, relative_path, _ in upload_tasks:
+                                          # Target path is the original directory + relative path
+                                          target_path = f"{original_dir}{relative_path}" if original_dir else relative_path
+                                          
+                                          # Get content type
+                                          mime_type, _ = mimetypes.guess_type(file_path)
+                                          content_type = mime_type or 'application/octet-stream'
+                                          
+                                          # Submit upload task
+                                          future = upload_executor.submit(
+                                              s3.upload_file,
+                                              file_path,
+                                              os.environ['R2_BUCKET_NAME'],
+                                              target_path,
+                                              ExtraArgs={'ContentType': content_type}
+                                          )
+                                          upload_futures.append((future, relative_path))
+                                          
+                                      # Process results as they complete
+                                      for future, file_name in upload_futures:
+                                          try:
+                                              future.result()
+                                              successful_uploads += 1
+                                          except Exception as e:
+                                              print(f"Error uploading {file_name}: {e}")
+                                  
+                                  print(f"Uploaded {successful_uploads}/{file_count} extracted files to their original location")
+                                  
+                                  # Also upload files to the unzipped/ prefix for backup/reference
+                                  backup_uploads = 0
+                                  with concurrent.futures.ThreadPoolExecutor(max_workers=10) as upload_executor:
+                                      # Submit all upload tasks to the unzipped directory
                                       future_to_file = {upload_executor.submit(upload_file, task): task[1] for task in upload_tasks}
                                       
                                       # Process results as they complete
@@ -169,15 +207,15 @@ jobs:
                                           try:
                                               result = future.result()
                                               if result:
-                                                  successful_uploads += 1
+                                                  backup_uploads += 1
                                           except Exception as e:
-                                              print(f"Error uploading {file_name}: {e}")
+                                              print(f"Error uploading backup {file_name}: {e}")
                                   
-                                  print(f"Uploaded {successful_uploads}/{file_count} extracted files to R2")
+                                  print(f"Backed up {backup_uploads}/{file_count} extracted files to unzipped/ prefix")
                                   
-                                  # Move the original zip to the processed directory
+                                  # Store original zip in processed directory for reference
                                   processed_key = f"{processed_prefix}{os.path.basename(filename)}"
-                                  print(f"Moving original zip to {processed_key}")
+                                  print(f"Storing original zip in {processed_key}")
                                   
                                   s3.copy_object(
                                       Bucket=os.environ['R2_BUCKET_NAME'],
